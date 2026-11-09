@@ -116,7 +116,7 @@ body:has(.session-workspace) {
 
 .activity-toggle,
 .activity-header button,
-.activity-task-retry {
+.transcript-load {
   min-block-size: 2.75rem;
 }
 

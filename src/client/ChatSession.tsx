@@ -338,7 +338,9 @@ export function ChatSession({ sessionId, username }: ChatSessionProps) {
         >
           {activeConversation === undefined ? (
             <p className="transcript-empty">Loading conversation…</p>
-          ) : activeConversation.entries.length === 0 && activeConversation.live === null ? (
+          ) : activeConversation.entries.length === 0 &&
+            !activeConversation.earlier &&
+            activeConversation.live === null ? (
             <p className="transcript-empty">
               Send a message to begin. You can fork the conversation from any user or assistant
               message.
@@ -348,6 +350,10 @@ export function ChatSession({ sessionId, username }: ChatSessionProps) {
               entries={activeConversation.entries}
               tools={activeConversation.tools}
               runActive={activeConversation.live !== null}
+              earlier={activeConversation.earlier}
+              gaps={activeConversation.gaps}
+              onLoadEarlier={session.loadEarlier}
+              onFillGap={session.fillGap}
               onFork={
                 activeConversationId === undefined
                   ? undefined
@@ -448,7 +454,6 @@ export function ChatSession({ sessionId, username }: ChatSessionProps) {
         activeConversationId={activeConversationId}
         onClose={closeActivity}
         closeButtonRef={activityCloseRef}
-        onRetryTask={session.retryTask}
         onOpenConversation={(conversationId) => {
           if (conversationId !== session.activeConversationId) {
             window.history.pushState(null, "", `?conversation=${conversationId}`);

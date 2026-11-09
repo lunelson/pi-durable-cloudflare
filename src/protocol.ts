@@ -1,6 +1,9 @@
+import { assertValidOp, type Op } from "@earendil-works/chord/delta";
 import type {
-  AgentEvent,
   BlockedReason,
+  ConversationView,
+  Cursor,
+  EntryRecord,
   InboxState,
   TaskGraph,
   TaskGraphNode,
@@ -10,6 +13,8 @@ import type {
 export const ROOT_CONVERSATION_ID = 1;
 export const MAX_PROMPT_CHARACTERS = 100_000;
 export const MAX_REQUEST_ID_CHARACTERS = 256;
+/** Most entries one `conversation.entries` request may load. */
+export const MAX_ENTRY_PAGE_SIZE = 100;
 // JSON may escape each prompt code unit as six characters.
 export const MAX_CLIENT_FRAME_CHARACTERS =
   MAX_PROMPT_CHARACTERS * 6 + MAX_REQUEST_ID_CHARACTERS + 1024;
@@ -117,11 +122,20 @@ export type ClientCommand =
       readonly content: string;
     }
   | {
-      /** Run a task parked by the restart limit again. */
-      readonly type: "task.retry";
+      /** Load a page of a conversation's history, for entries outside the view's window. */
+      readonly type: "conversation.entries";
       readonly requestId: string;
-      readonly taskId: number;
+      readonly conversationId: number;
+      readonly query: EntryPageQuery;
+      readonly limit: number;
     };
+
+/** Inclusive entry ID bounds and order of a history page, as `Conversation.entries()` takes them. */
+export interface EntryPageQuery {
+  readonly minEntryId?: number;
+  readonly maxEntryId?: number;
+  readonly order?: "ascending" | "descending";
+}
 export type ClientCommandType = Exclude<ClientCommand["type"], "presence.typing">;
 
 export type CommandResult =
@@ -161,14 +175,24 @@ export type ServerEvent =
       readonly activity: TaskGraph;
     }
   | {
-      readonly type: "conversation.events";
+      /** The first value of a conversation watch: a window over the transcript and the conversation's documents. */
+      readonly type: "conversation.view";
       readonly conversationId: number;
-      readonly events: readonly AgentEvent[];
+      readonly view: ConversationView;
     }
   | {
-      readonly type: "conversation.inbox";
+      /** Operations that turn the previous view of the conversation into the next one. */
+      readonly type: "conversation.ops";
       readonly conversationId: number;
-      readonly items: readonly QueuedInput[];
+      readonly ops: readonly Op[];
+    }
+  | {
+      /** A page of history answering a `conversation.entries` command. */
+      readonly type: "conversation.entries";
+      readonly requestId: string;
+      readonly conversationId: number;
+      readonly entries: readonly EntryRecord[];
+      readonly next?: Cursor;
     }
   | {
       readonly type: "presence.typing";
@@ -213,7 +237,7 @@ const commandTypes = new Set<ClientCommandType>([
   "conversation.create",
   "conversation.fork",
   "prompt.submit",
-  "task.retry",
+  "conversation.entries",
 ]);
 
 const requireCommandType = (value: unknown): ClientCommandType => {
@@ -235,7 +259,6 @@ const BLOCKED_REASONS = new Set<BlockedReason>([
   "missing_task",
   "task_too_old",
   "migration_failed",
-  "restart_limit",
 ]);
 
 const optionalBlockedReason = (value: unknown): BlockedReason | undefined => {
@@ -401,14 +424,58 @@ export function parseClientCommand(message: string): ClientCommand {
         content: value.content,
       };
     }
-    case "task.retry":
-      return { type: value.type, requestId, taskId: requireId(value.taskId, "taskId") };
+    case "conversation.entries": {
+      if (!isRecord(value.query)) throw new InvalidClientCommand("query must be an object");
+      const { minEntryId, maxEntryId, order } = value.query;
+      if (order !== undefined && order !== "ascending" && order !== "descending") {
+        throw new InvalidClientCommand("query.order must be ascending or descending");
+      }
+      const limit = requireId(value.limit, "limit");
+      if (limit > MAX_ENTRY_PAGE_SIZE) {
+        throw new InvalidClientCommand(`limit cannot exceed ${MAX_ENTRY_PAGE_SIZE}`);
+      }
+      const min = optionalId(minEntryId, "query.minEntryId");
+      const max = optionalId(maxEntryId, "query.maxEntryId");
+      return {
+        type: value.type,
+        requestId,
+        conversationId: requireId(value.conversationId, "conversationId"),
+        query: {
+          ...(min === undefined ? {} : { minEntryId: min }),
+          ...(max === undefined ? {} : { maxEntryId: max }),
+          ...(order === undefined ? {} : { order }),
+        },
+        limit,
+      };
+    }
     default:
       throw new InvalidClientCommand(`Unknown command type: ${value.type}`);
   }
 }
 
-/** Validate the application envelope. Agent event payloads remain owned by pi-durable's typed protocol. */
+const isEntryRecord = (value: unknown): boolean =>
+  isRecord(value) &&
+  typeof value.kind === "string" &&
+  Number.isSafeInteger(value.id) &&
+  Number.isSafeInteger(value.conversationId);
+
+/** Checks the view's shape; the documents' and entries' payloads remain owned by pi-durable's typed state. */
+const parseConversationView = (value: unknown): ConversationView => {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.conversation) ||
+    !Array.isArray(value.entries) ||
+    !value.entries.every(isEntryRecord) ||
+    !isRecord(value.docs) ||
+    !Object.values(value.docs).every(isRecord) ||
+    (value.before !== undefined && !Number.isSafeInteger(value.before))
+  ) {
+    throw new Error("Conversation view payload is invalid");
+  }
+  return value as unknown as ConversationView;
+};
+
+/** Validate the application envelope. View and entry payloads remain owned by pi-durable's typed state. */
 export function parseServerEventEnvelope(message: string): ServerEvent {
   const value: unknown = JSON.parse(message);
   if (!isRecord(value) || typeof value.type !== "string") {
@@ -435,38 +502,33 @@ export function parseServerEventEnvelope(message: string): ServerEvent {
       return { type: value.type, conversation: parseConversationSummary(value.conversation) };
     case "session.activity":
       return { type: value.type, activity: parseTaskGraph(value.activity) };
-    case "conversation.events": {
+    case "conversation.view": {
       const conversationId = requireId(value.conversationId, "conversationId");
-      if (
-        !Array.isArray(value.events) ||
-        !value.events.every((event) => isRecord(event) && typeof event.type === "string")
-      ) {
-        throw new Error("Conversation events payload is invalid");
+      return { type: value.type, conversationId, view: parseConversationView(value.view) };
+    }
+    case "conversation.ops": {
+      const conversationId = requireId(value.conversationId, "conversationId");
+      if (!Array.isArray(value.ops)) throw new Error("Conversation ops payload is invalid");
+      // Ops are applied as paths into the view, so each must be well formed and free of prototype segments.
+      for (const op of value.ops) assertValidOp(op);
+      return { type: value.type, conversationId, ops: value.ops as readonly Op[] };
+    }
+    case "conversation.entries": {
+      const requestId = requireRequestId(value.requestId);
+      const conversationId = requireId(value.conversationId, "conversationId");
+      if (!Array.isArray(value.entries) || !value.entries.every(isEntryRecord)) {
+        throw new Error("Conversation entries payload is invalid");
+      }
+      if (value.next !== undefined && !isRecord(value.next)) {
+        throw new Error("Conversation entries cursor is invalid");
       }
       return {
         type: value.type,
+        requestId,
         conversationId,
-        events: value.events as unknown as readonly AgentEvent[],
+        entries: value.entries as unknown as readonly EntryRecord[],
+        ...(value.next === undefined ? {} : { next: value.next as Cursor }),
       };
-    }
-    case "conversation.inbox": {
-      const conversationId = requireId(value.conversationId, "conversationId");
-      if (!Array.isArray(value.items)) throw new Error("Conversation inbox payload is invalid");
-      const items = value.items.map((item): QueuedInput => {
-        if (
-          !isRecord(item) ||
-          (item.mode !== "steer" && item.mode !== "followUp") ||
-          typeof item.text !== "string"
-        ) {
-          throw new Error("Queued input is invalid");
-        }
-        return {
-          submissionId: requireId(item.submissionId, "submissionId"),
-          mode: item.mode,
-          text: item.text,
-        };
-      });
-      return { type: value.type, conversationId, items };
     }
     case "presence.typing": {
       const conversationId = requireId(value.conversationId, "conversationId");

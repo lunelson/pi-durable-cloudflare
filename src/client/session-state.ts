@@ -1,21 +1,24 @@
 import type { JsonValue } from "@earendil-works/chord";
+import { applyImmutable } from "@earendil-works/chord/delta";
 import type { AssistantMessage, Message, NestedToolCalls } from "@earendil-works/pi-ai";
 import type {
   AgentState,
-  AgentEvent,
   CompactionReason,
+  ConversationView,
   EntryRecord,
-  JsonObject,
-  MessageChange,
-  SnapshotEvent,
+  InboxState,
+  LiveState,
   ToolDiagnostic,
   TaskGraph,
+  TranscriptItem,
+  TranscriptView,
   UsageState,
 } from "@earendil-works/pi-durable";
 import { CompactionEntry, ResetEntry, ToolResultEntry } from "@earendil-works/pi-durable";
 import {
   ROOT_CONVERSATION_ID,
   parseScheduledInstruction,
+  queuedInputs,
   type ConnectionStatus,
   type ConversationSummary,
   type QueuedInput,
@@ -57,6 +60,9 @@ export interface TranscriptEntry {
   readonly toolResult?: TranscriptToolResult;
 }
 
+/** Entries strictly between `after` and `upTo` that the client has not loaded. */
+export type TranscriptGap = Extract<TranscriptItem, { readonly kind: "gap" }>;
+
 export interface LiveConversation {
   readonly active: boolean;
   readonly text: string;
@@ -70,7 +76,6 @@ export interface ToolProgress {
   readonly callId: string;
   readonly name: string;
   readonly status: "pending" | "running" | "done";
-  readonly args?: JsonObject;
   readonly output?: string;
   readonly details?: JsonValue;
   readonly diagnostics?: readonly ToolDiagnostic[];
@@ -82,9 +87,14 @@ export interface LiveCompaction {
   readonly blocking: boolean;
 }
 
+/** What the client renders of one conversation, derived from its view and the history it loaded. */
 export interface ConversationSnapshot {
   readonly id: number;
   readonly entries: readonly TranscriptEntry[];
+  /** Whether history before the first entry is not loaded yet. */
+  readonly earlier: boolean;
+  /** Ranges of history between loaded entries, after a reconnect missed more than the view's window. */
+  readonly gaps: readonly TranscriptGap[];
   readonly partial?: AssistantMessage;
   readonly live: LiveConversation | null;
   readonly tools: readonly ToolProgress[];
@@ -94,6 +104,7 @@ export interface ConversationSnapshot {
   readonly typing: readonly string[];
   readonly agent?: Readonly<AgentState>;
   readonly usage?: Readonly<UsageState>;
+  /** Why the newest run or compaction ended without a result, until a later one starts. */
   readonly failure?: {
     readonly taskId: number;
     readonly kind: string;
@@ -105,7 +116,9 @@ export interface SessionState {
   readonly status: ConnectionStatus;
   readonly conversations: readonly ConversationSummary[];
   readonly activeConversationId?: number;
-  readonly snapshots: Readonly<Record<number, ConversationSnapshot>>;
+  /** Replicas of the conversation views the server sent: the first value, then its operations. */
+  readonly views: Readonly<Record<number, ConversationView>>;
+  readonly typing: Readonly<Record<number, readonly string[]>>;
   readonly activity?: TaskGraph;
   readonly error?: string;
 }
@@ -120,7 +133,8 @@ export type SessionAction =
 export const initialSessionState: SessionState = {
   status: "connecting",
   conversations: [],
-  snapshots: {},
+  views: {},
+  typing: {},
 };
 
 export function sessionReducer(state: SessionState, action: SessionAction): SessionState {
@@ -160,40 +174,22 @@ function reduceServerEvent(state: SessionState, event: ServerEvent): SessionStat
       ].sort((left, right) => left.id - right.id);
       return { ...state, conversations };
     }
-    case "session.activity": {
+    case "session.activity":
       return { ...state, activity: event.activity };
+    case "conversation.view":
+      return { ...state, views: { ...state.views, [event.conversationId]: event.view } };
+    case "conversation.ops": {
+      const before = state.views[event.conversationId];
+      // Ops follow their view on one socket; without it, only a replacement can be applied.
+      if (before === undefined && event.ops[0]?.[0] !== "r") return state;
+      const view = applyImmutable<ConversationView>(before, event.ops);
+      return { ...state, views: { ...state.views, [event.conversationId]: view } };
     }
-    case "conversation.events": {
-      const before =
-        state.snapshots[event.conversationId] ?? emptyConversation(event.conversationId);
-      const conversation = event.events.reduce(reduceAgentEvent, before);
-      return {
-        ...state,
-        snapshots: { ...state.snapshots, [event.conversationId]: conversation },
-      };
-    }
-    case "conversation.inbox": {
-      const before =
-        state.snapshots[event.conversationId] ?? emptyConversation(event.conversationId);
-      return {
-        ...state,
-        snapshots: {
-          ...state.snapshots,
-          [event.conversationId]: { ...before, queued: event.items },
-        },
-      };
-    }
-    case "presence.typing": {
-      const before =
-        state.snapshots[event.conversationId] ?? emptyConversation(event.conversationId);
-      return {
-        ...state,
-        snapshots: {
-          ...state.snapshots,
-          [event.conversationId]: { ...before, typing: event.usernames },
-        },
-      };
-    }
+    case "conversation.entries":
+      // Pages answer the client's transcript loader directly.
+      return state;
+    case "presence.typing":
+      return { ...state, typing: { ...state.typing, [event.conversationId]: event.usernames } };
     case "command.result":
       if (!event.ok) return { ...state, error: event.error.message };
       return event.conversationId === undefined ||
@@ -205,126 +201,48 @@ function reduceServerEvent(state: SessionState, event: ServerEvent): SessionStat
   }
 }
 
-const emptyConversation = (id: number): ConversationSnapshot => ({
-  id,
-  entries: [],
-  live: null,
-  tools: [],
-  compactions: [],
-  queued: [],
-  typing: [],
-});
-
-function reduceAgentEvent(
-  conversation: ConversationSnapshot,
-  event: AgentEvent,
+/** Render state of a conversation from its transcript view, the view's documents, and who is typing in it. */
+export function conversationSnapshot(
+  view: TranscriptView,
+  typing: readonly string[] = [],
 ): ConversationSnapshot {
-  switch (event.type) {
-    case "snapshot":
-      return snapshotConversation(conversation, event);
-    case "run_start":
-    case "turn_start":
-      return {
-        ...conversation,
-        failure: undefined,
-        live: {
-          active: true,
-          text: conversation.live?.text ?? "",
-          retry: conversation.live?.retry,
-        },
-      };
-    case "run_end":
-      return { ...conversation, live: null, partial: undefined, tools: [] };
-    case "message_start":
-      return event.message.role === "assistant"
-        ? withPartial(conversation, event.message, conversation.live?.retry)
-        : conversation;
-    case "message_update":
-      return conversation.partial === undefined
-        ? conversation
-        : withPartial(
-            conversation,
-            applyMessageChanges(conversation.partial, event.changes, event.usage),
-            conversation.live?.retry,
-          );
-    case "message_end":
-      return clearCommittedPartial(appendEntry(conversation, event.entry), event.entry);
-    case "entry_appended":
-      return appendEntry(conversation, event.entry);
-    case "tool_execution_start":
-      return updateTool(conversation, event.toolCallId, {
-        callId: event.toolCallId,
-        name: event.toolName,
-        status: "running",
-        args: event.args,
-      });
-    case "tool_execution_update":
-      return updateToolProgress(conversation, event);
-    case "tool_execution_end":
-      return updateTool(conversation, event.toolCallId, {
-        ...(conversation.tools.find(({ callId }) => callId === event.toolCallId) ?? {
-          callId: event.toolCallId,
-          name: event.toolName,
-        }),
-        status: "done",
-      });
-    case "auto_retry_start":
-      return {
-        ...conversation,
-        live: {
-          active: true,
-          text: conversation.live?.text ?? "",
-          retry: { at: event.at, error: event.errorMessage },
-        },
-      };
-    case "auto_retry_end":
-      return conversation.live === null
-        ? conversation
-        : { ...conversation, live: { ...conversation.live, retry: undefined } };
-    case "agent_changed":
-      return { ...conversation, agent: event.agent };
-    case "usage_changed":
-      return { ...conversation, usage: event.usage };
-    case "task_failed":
-      return {
-        ...conversation,
-        failure: {
-          taskId: event.taskId,
-          kind: event.kind,
-          message: event.message,
-        },
-      };
-    case "compaction_start":
-      return conversation.compactions.some(({ taskId }) => taskId === event.taskId)
-        ? conversation
-        : {
-            ...conversation,
-            compactions: [
-              ...conversation.compactions,
-              { taskId: event.taskId, reason: event.reason, blocking: event.blocking },
-            ],
-          };
-    case "compaction_end":
-      return {
-        ...conversation,
-        compactions: conversation.compactions.filter(({ taskId }) => taskId !== event.taskId),
-      };
-    default:
-      return conversation;
+  const live = (view.docs["pi.live"] ?? {}) as LiveState;
+  const inbox = view.docs["pi.inbox"] as InboxState | undefined;
+  const agent = view.docs["pi.agent"] as AgentState | undefined;
+  const usage = view.docs["pi.usage"] as UsageState | undefined;
+  const partial = live.generation?.message as AssistantMessage | undefined;
+  const entries: TranscriptEntry[] = [];
+  const gaps: TranscriptGap[] = [];
+  let earlier = false;
+  for (const item of view.items) {
+    if (item.kind === "entry") entries.push(transcriptEntry(item.entry));
+    else if (item.kind === "gap") gaps.push(item);
+    else earlier = true;
   }
-}
-
-/** Replace everything the agent snapshot describes; the queue arrives separately as `conversation.inbox`. */
-function snapshotConversation(
-  conversation: ConversationSnapshot,
-  event: SnapshotEvent,
-): ConversationSnapshot {
-  const partial = event.generation?.message;
+  const failure =
+    live.runFailure !== undefined
+      ? {
+          taskId: live.runFailure.taskId,
+          kind: "Run",
+          message:
+            live.runFailure.detail === undefined
+              ? live.runFailure.reason
+              : `${live.runFailure.reason}: ${live.runFailure.detail}`,
+        }
+      : live.compactionFailure !== undefined
+        ? {
+            taskId: live.compactionFailure.taskId,
+            kind: "Compaction",
+            message: live.compactionFailure.error,
+          }
+        : undefined;
   return {
-    id: conversation.id,
-    entries: event.entries.map(transcriptEntry),
-    live: liveConversation(event.run !== undefined, partial, event.generation?.retry),
-    tools: event.tools.map((tool) => ({
+    id: view.conversation.id,
+    entries,
+    earlier,
+    gaps,
+    live: liveConversation(live.run !== undefined, partial, live.generation?.retry),
+    tools: (live.tools ?? []).map((tool) => ({
       callId: tool.callId,
       name: tool.name,
       status: tool.status,
@@ -332,69 +250,17 @@ function snapshotConversation(
       ...(tool.details === undefined ? {} : { details: tool.details }),
       ...(tool.diagnostics === undefined ? {} : { diagnostics: tool.diagnostics }),
     })),
-    compactions: event.compactions.map(({ taskId, reason, blocking }) => ({
+    compactions: (live.compactions ?? []).map(({ taskId, trigger, blocking }) => ({
       taskId,
-      reason,
+      reason: trigger,
       blocking,
     })),
-    agent: event.agent,
-    usage: event.usage,
-    queued: conversation.queued,
-    typing: conversation.typing,
+    queued: queuedInputs(inbox),
+    typing,
+    ...(agent === undefined ? {} : { agent }),
+    ...(usage === undefined ? {} : { usage }),
     ...(partial === undefined ? {} : { partial }),
-  };
-}
-
-function updateTool(
-  conversation: ConversationSnapshot,
-  callId: string,
-  tool: ToolProgress,
-): ConversationSnapshot {
-  const index = conversation.tools.findIndex((candidate) => candidate.callId === callId);
-  return {
-    ...conversation,
-    tools:
-      index < 0
-        ? [...conversation.tools, tool]
-        : conversation.tools.map((candidate, candidateIndex) =>
-            candidateIndex === index ? tool : candidate,
-          ),
-  };
-}
-
-function updateToolProgress(
-  conversation: ConversationSnapshot,
-  event: Extract<AgentEvent, { readonly type: "tool_execution_update" }>,
-): ConversationSnapshot {
-  const current = conversation.tools.find(({ callId }) => callId === event.toolCallId) ?? {
-    callId: event.toolCallId,
-    name: event.toolName,
-    status: "running" as const,
-  };
-  let output = current.output;
-  if (event.output !== undefined) {
-    output =
-      "set" in event.output
-        ? event.output.set
-        : (output ?? "").slice(event.output.trimStart ?? 0) + (event.output.append ?? "");
-  }
-  return updateTool(conversation, event.toolCallId, {
-    ...current,
-    ...(output === undefined ? {} : { output }),
-    ...("details" in event ? { details: event.details } : {}),
-    ...("diagnostics" in event ? { diagnostics: event.diagnostics } : {}),
-  });
-}
-
-function withPartial(
-  conversation: ConversationSnapshot,
-  partial: AssistantMessage,
-  retry: LiveConversation["retry"],
-): ConversationSnapshot {
-  return {
-    ...conversation,
-    partial,
-    live: liveConversation(true, partial, retry),
+    ...(failure === undefined ? {} : { failure }),
   };
 }
 
@@ -409,117 +275,6 @@ function liveConversation(
     text: partial === undefined ? "" : assistantText(partial.content),
     ...(retry === undefined ? {} : { retry }),
   };
-}
-
-function clearCommittedPartial(
-  conversation: ConversationSnapshot,
-  entry: EntryRecord,
-): ConversationSnapshot {
-  if (entry.model?.[0]?.role !== "assistant" || conversation.partial === undefined)
-    return conversation;
-  return {
-    ...conversation,
-    partial: undefined,
-    live:
-      conversation.live === null
-        ? null
-        : { active: conversation.live.active, text: "", retry: conversation.live.retry },
-  };
-}
-
-function appendEntry(conversation: ConversationSnapshot, entry: EntryRecord): ConversationSnapshot {
-  if (conversation.entries.some(({ id }) => id === entry.id)) return conversation;
-  const next = transcriptEntry(entry);
-  if (entry.head === undefined)
-    return { ...conversation, entries: [...conversation.entries, next] };
-  const kept = conversation.entries.findIndex(
-    (candidate) => candidate.id >= entry.head! && candidate.kind !== "pi.reset",
-  );
-  return {
-    ...conversation,
-    entries: [next, ...conversation.entries.slice(kept < 0 ? conversation.entries.length : kept)],
-  };
-}
-
-function applyMessageChanges(
-  current: AssistantMessage,
-  changes: readonly MessageChange[],
-  usage: AssistantMessage["usage"],
-): AssistantMessage {
-  let message = structuredClone(current);
-  for (const change of changes) {
-    if (change.type === "message") {
-      message = structuredClone(change.message);
-      continue;
-    }
-    if (change.type === "block") {
-      message.content[change.contentIndex] = structuredClone(change.block);
-    } else if (
-      change.type === "text_start" ||
-      change.type === "thinking_start" ||
-      change.type === "toolcall_start"
-    ) {
-      message.content.splice(change.contentIndex, 0, structuredClone(change.block));
-    } else if (change.type === "text_delta") {
-      const block = message.content[change.contentIndex];
-      if (block?.type !== "text") throw new Error("Text delta does not target a text block");
-      block.text += change.delta;
-    } else if (change.type === "thinking_delta") {
-      const block = message.content[change.contentIndex];
-      if (block?.type !== "thinking") {
-        throw new Error("Thinking delta does not target a thinking block");
-      }
-      block.thinking += change.delta;
-    } else if (change.type === "toolcall_delta") {
-      applyToolCallDelta(message, change);
-    } else {
-      throw new Error(`Unsupported message change: ${change.type}`);
-    }
-  }
-  message.usage = usage;
-  return message;
-}
-
-function applyToolCallDelta(
-  message: AssistantMessage,
-  change: Extract<MessageChange, { readonly type: "toolcall_delta" }>,
-): void {
-  const block = message.content[change.contentIndex];
-  if (block?.type !== "toolCall") throw new Error("Tool-call delta does not target a tool call");
-  if (change.path.length === 0) throw new Error("Tool-call delta path is empty");
-
-  let target: unknown = block.arguments;
-  for (const segment of change.path.slice(0, -1)) {
-    if (!isMutableContainer(target)) throw new Error("Tool-call delta path is invalid");
-    target = mutableValue(target, segment);
-  }
-  if (!isMutableContainer(target)) throw new Error("Tool-call delta target is invalid");
-  const last = change.path.at(-1)!;
-  const current = mutableValue(target, last);
-  if (typeof current !== "string") throw new Error("Tool-call delta target is not a string");
-  setMutableValue(target, last, current + change.delta);
-}
-
-type MutableContainer = Record<string | number, unknown> | unknown[];
-
-const isMutableContainer = (value: unknown): value is MutableContainer =>
-  typeof value === "object" && value !== null;
-
-function mutableValue(target: MutableContainer, segment: string | number): unknown {
-  if (Array.isArray(target)) {
-    if (typeof segment !== "number") throw new Error("Array delta path requires a numeric index");
-    return target[segment];
-  }
-  return target[String(segment)];
-}
-
-function setMutableValue(target: MutableContainer, segment: string | number, value: unknown): void {
-  if (Array.isArray(target)) {
-    if (typeof segment !== "number") throw new Error("Array delta path requires a numeric index");
-    target[segment] = value;
-  } else {
-    target[String(segment)] = value;
-  }
 }
 
 function transcriptEntry(entry: EntryRecord): TranscriptEntry {

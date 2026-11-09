@@ -169,6 +169,51 @@ describe("session recovery", () => {
     });
   });
 
+  it("moves the alarm through onWake to the next sleep once the alarm resumed the due one", async () => {
+    const stub = env.SESSIONS.getByName("alarm-follows-wake");
+    const dueAt = Date.now() + 1_000;
+    // Far beyond the recovery heartbeat, so an alarm at this time can only come from the sleep's deadline.
+    const laterAt = Date.now() + 30 * 60_000;
+    await seed(stub, (harness) =>
+      harness.commit(async (tx) => {
+        for (const [id, runAt] of [
+          ["schedule:due", dueAt],
+          ["schedule:later", laterAt],
+        ] as const) {
+          await tx.createTask(
+            DeliverScheduledInstruction,
+            { id, conversationId: ROOT_CONVERSATION_ID, instruction: id, runAt },
+            {
+              ownership: { kind: "conversation" },
+              conversationId: ROOT_CONVERSATION_ID,
+              background: true,
+            },
+          );
+        }
+      }, context),
+    );
+
+    // Opening reports the earliest sleep.
+    await expectAlarm(stub, dueAt);
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, dueAt - Date.now()) + 20));
+    // Only the alarm handler's `resume()` makes the due delivery runnable: the Harness keeps no timer for sleeps.
+    await runDurableObjectAlarm(stub);
+
+    // The due delivery submits its instruction; the run ends without a model, and the live Harness reports the
+    // remaining sleep through `onWake`, which moves the alarm to its deadline.
+    await expectAlarm(stub, laterAt);
+    const submissions = await runInDurableObject(stub, async (_instance, state) => {
+      const storage = await openStorage(state);
+      return Promise.all(
+        ["schedule:due", "schedule:later"].map((requestId) =>
+          storage.submissionByRequest(ROOT_CONVERSATION_ID, requestId, context),
+        ),
+      );
+    });
+    expect(submissions[0]).toMatchObject({ requestId: "schedule:due", type: "input" });
+    expect(submissions[1]).toBeUndefined();
+  });
+
   it("clears an early alarm that finds an idle Session", async () => {
     const stub = env.SESSIONS.getByName("early-platform-alarm");
     // A live, idle Session: `onWake` reports nothing to do, and does not report it again unchanged.

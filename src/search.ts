@@ -1,5 +1,5 @@
 import type { Context } from "@earendil-works/chord";
-import { type AssistantMessage, type Message, Type } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
   configure,
@@ -11,6 +11,7 @@ import {
   type ToolRegistration,
   UserEntry,
 } from "@earendil-works/pi-durable";
+import { obj, str } from "@earendil-works/pi-schema";
 
 export const SEARCH_CONVERSATIONS_TOOL_NAME = "search_conversations";
 export const SEARCH_HISTORY_TOOL_NAME = "search_history";
@@ -127,9 +128,10 @@ export const searchConversationsTool: ToolRegistration = {
   description:
     "Find user and assistant messages containing a term in ordinary top-level conversation turns. " +
     `Case-insensitive substring match; returns at most ${MAX_MATCHES} matches with snippets.`,
-  parameters: Type.Object({
-    term: Type.String({ description: "Word or phrase to find, for example postgres" }),
-  }),
+  parameters: obj(
+    { term: str({ description: "Word or phrase to find, for example postgres" }) },
+    { open: true },
+  ),
   replay: "safe",
   execute: async (args, api, context) => {
     const { term } = args as { term: string };
@@ -152,9 +154,10 @@ export const searchHistoryTool: ToolRegistration = {
   description:
     "Search ordinary conversation turns in this session to answer a question about earlier discussions. " +
     "A subagent searches the conversations and replies with a short answer that cites conversation IDs.",
-  parameters: Type.Object({
-    question: Type.String({ description: "What to find out from past conversations" }),
-  }),
+  parameters: obj(
+    { question: str({ description: "What to find out from past conversations" }) },
+    { open: true },
+  ),
   // Safe to rerun after a crash: a rerun finds the child it created and the submission it made.
   replay: "safe",
   execute: async (args, api, context) => {

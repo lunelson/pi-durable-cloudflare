@@ -1,13 +1,15 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { applyImmutable, type Op } from "@earendil-works/chord/delta";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi-ai";
 import {
   type ConversationId,
+  type ConversationView,
   createRegistry,
   Harness,
   type HarnessOptions,
-  type TaskId,
+  type InboxState,
 } from "@earendil-works/pi-durable";
 import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
 import { describe, expect, it } from "vitest";
@@ -20,9 +22,21 @@ import { DeliverScheduledInstruction } from "../src/schedule.ts";
 type ProtocolMessage = {
   readonly type?: string;
   readonly conversationId?: number;
-  readonly events?: readonly unknown[];
-  readonly items?: readonly { readonly text?: unknown }[];
+  readonly view?: ConversationView;
+  readonly ops?: readonly Op[];
   readonly usernames?: readonly string[];
+};
+
+const contentText = (content: unknown): string | undefined => {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  return content
+    .flatMap((part) =>
+      typeof part === "object" && part !== null && "text" in part && typeof part.text === "string"
+        ? [part.text]
+        : [],
+    )
+    .join("\n");
 };
 
 const userEntryText = (value: unknown): string | undefined => {
@@ -32,36 +46,23 @@ const userEntryText = (value: unknown): string | undefined => {
   };
   const message = entry.model?.[0];
   if (message?.role !== "user") return undefined;
-  if (typeof message.content === "string") return message.content;
-  if (!Array.isArray(message.content)) return undefined;
-  return message.content
-    .flatMap((part) =>
-      typeof part === "object" && part !== null && "text" in part && typeof part.text === "string"
-        ? [part.text]
-        : [],
-    )
-    .join("\n");
+  return contentText(message.content);
 };
 
-const submittedTexts = (message: ProtocolMessage): readonly string[] => {
-  if (message.type === "conversation.inbox") {
-    return (message.items ?? []).flatMap(({ text }) => (typeof text === "string" ? [text] : []));
-  }
-  if (message.type !== "conversation.events") return [];
-  return (message.events ?? []).flatMap((event) => {
-    if (typeof event !== "object" || event === null) return [];
-    if ("entry" in event) {
-      const text = userEntryText(event.entry);
+/** User input a conversation view shows: placed user entries and queued inbox items. */
+const submittedTexts = (view: ConversationView | undefined): readonly string[] => {
+  if (view === undefined) return [];
+  const inbox = view.docs["pi.inbox"] as InboxState | undefined;
+  return [
+    ...view.entries.flatMap((entry) => {
+      const text = userEntryText(entry);
       return text === undefined ? [] : [text];
-    }
-    if ("entries" in event && Array.isArray(event.entries)) {
-      return event.entries.flatMap((entry) => {
-        const text = userEntryText(entry);
-        return text === undefined ? [] : [text];
-      });
-    }
-    return [];
-  });
+    }),
+    ...(inbox?.items ?? []).flatMap((item) => {
+      const text = item.mode === "write" ? undefined : contentText(item.content);
+      return text === undefined ? [] : [text];
+    }),
+  ];
 };
 
 const sessionSocketUrl = (sessionId: string, username: string, clientId: string): string => {
@@ -74,8 +75,16 @@ const sessionSocketUrl = (sessionId: string, username: string, clientId: string)
 const jsonMessages = (socket: WebSocket) => {
   const queued: unknown[] = [];
   const waiting: Array<(value: unknown) => void> = [];
+  // The client's replicas: each conversation's view, then its operations.
+  const views = new Map<number, ConversationView>();
   socket.addEventListener("message", (event) => {
     const value: unknown = JSON.parse(String(event.data));
+    const message = value as ProtocolMessage;
+    if (message.type === "conversation.view") views.set(message.conversationId!, message.view!);
+    if (message.type === "conversation.ops") {
+      const id = message.conversationId!;
+      views.set(id, applyImmutable(views.get(id), message.ops!));
+    }
     const resolve = waiting.shift();
     if (resolve === undefined) queued.push(value);
     else resolve(value);
@@ -95,9 +104,15 @@ const jsonMessages = (socket: WebSocket) => {
   return {
     next,
     nextMatching,
-    /** Session snapshot, root conversation events, root inbox, and typing presence. */
+    view: (conversationId: number) => views.get(conversationId),
+    /** Read frames until the conversation's replica shows `text` as submitted input. */
+    untilSubmitted: async (conversationId: number, text: string): Promise<readonly string[]> => {
+      while (!submittedTexts(views.get(conversationId)).includes(text)) await next();
+      return submittedTexts(views.get(conversationId));
+    },
+    /** Session snapshot, root conversation view, and typing presence. */
     skipConnectFrames: async (): Promise<void> => {
-      for (let index = 0; index < 4; index++) await next();
+      for (let index = 0; index < 3; index++) await next();
     },
   };
 };
@@ -213,14 +228,10 @@ describe("chat application", () => {
 
     const aliceText = "[Alice]\nStart the plan";
     const aliceViews = await Promise.all([
-      aliceMessages.nextMatching<ProtocolMessage>((message) =>
-        submittedTexts(message).includes(aliceText),
-      ),
-      bobMessages.nextMatching<ProtocolMessage>((message) =>
-        submittedTexts(message).includes(aliceText),
-      ),
+      aliceMessages.untilSubmitted(1, aliceText),
+      bobMessages.untilSubmitted(1, aliceText),
     ]);
-    expect(aliceViews.map(submittedTexts)).toEqual([
+    expect(aliceViews).toEqual([
       expect.arrayContaining([aliceText]),
       expect.arrayContaining([aliceText]),
     ]);
@@ -236,14 +247,10 @@ describe("chat application", () => {
 
     const bobText = "[Bob Assistant]\nAdd the risks";
     const bobViews = await Promise.all([
-      aliceMessages.nextMatching<ProtocolMessage>((message) =>
-        submittedTexts(message).includes(bobText),
-      ),
-      bobMessages.nextMatching<ProtocolMessage>((message) =>
-        submittedTexts(message).includes(bobText),
-      ),
+      aliceMessages.untilSubmitted(1, bobText),
+      bobMessages.untilSubmitted(1, bobText),
     ]);
-    expect(bobViews.map(submittedTexts)).toEqual([
+    expect(bobViews).toEqual([
       expect.arrayContaining([bobText]),
       expect.arrayContaining([bobText]),
     ]);
@@ -278,90 +285,6 @@ describe("chat application", () => {
 
     // Whatever the submit path armed, `onWake` deletes the alarm once nothing can run.
     await expectAlarm(stub, null);
-    socket.close(1000, "test complete");
-  });
-
-  it("shows a task the restart limit parked and runs it again on retry", async () => {
-    const sessionId = "parked-task-retry";
-    const stub = env.SESSIONS.getByName(sessionId);
-    const runAt = Date.now() + 3_600_000;
-    const taskId = await runInDurableObject(stub, async (_instance, state) => {
-      await state.blockConcurrencyWhile(async () => {});
-      const storage = await openDurableObjectSqliteStorage(state.storage);
-      const harness = await Harness.open(storage, createChatHarnessOptions(), BACKGROUND_CONTEXT);
-      let id: number;
-      try {
-        const root = await harness.root(BACKGROUND_CONTEXT);
-        id = await root.commit(
-          (tx) =>
-            tx.createTask(
-              DeliverScheduledInstruction,
-              { id: "schedule:parked", conversationId: root.id, instruction: "Parked", runAt },
-              { ownership: { kind: "conversation" }, background: true },
-            ),
-          BACKGROUND_CONTEXT,
-        );
-      } finally {
-        await harness.close(BACKGROUND_CONTEXT);
-      }
-      // As if four instances had died while running it: the next open counts a fifth cut-off and parks the task.
-      // The closed harness closed its storage; write through a fresh one.
-      const rewrite = await openDurableObjectSqliteStorage(state.storage);
-      const record = (await rewrite.task(id as TaskId, BACKGROUND_CONTEXT))!;
-      if (record.state.status !== "pending") throw new Error("The delivery task should be pending");
-      await rewrite.commit(
-        [
-          {
-            type: "task",
-            value: {
-              ...record,
-              state: { status: "running", checkpoint: record.state.checkpoint },
-              restarts: 4,
-            },
-          },
-        ],
-        BACKGROUND_CONTEXT,
-      );
-      return id;
-    });
-    await evictDurableObject(stub);
-
-    const response = await exports.default.fetch(
-      sessionSocketUrl(sessionId, "Alice", "retry-task-client"),
-      { headers: { Upgrade: "websocket" } },
-    );
-    const socket = response.webSocket!;
-    const messages = jsonMessages(socket);
-    socket.accept();
-    type Activity = { tasks: Record<string, { blocked?: string; state: { status: string } }> };
-    const snapshot = await messages.nextMatching<{ type: string; session: { activity: Activity } }>(
-      ({ type }) => type === "session.snapshot",
-    );
-    expect(snapshot.session.activity.tasks[taskId]).toMatchObject({ blocked: "restart_limit" });
-    // A parked task is not active work, so it keeps no heartbeat alarm.
-    await expectAlarm(stub, null);
-
-    socket.send(JSON.stringify({ type: "task.retry", requestId: "retry-parked", taskId }));
-    await expect(
-      messages.nextMatching<{ type: string; requestId?: string }>(
-        (message) => message.type === "command.result" && message.requestId === "retry-parked",
-      ),
-    ).resolves.toMatchObject({ ok: true, command: "task.retry" });
-    const retried = await messages.nextMatching<{ type: string; activity?: Activity }>(
-      (message) =>
-        message.type === "session.activity" &&
-        message.activity?.tasks[taskId]?.state.status === "sleeping",
-    );
-    expect(retried.activity?.tasks[taskId]?.blocked).toBeUndefined();
-    await expectAlarm(stub, runAt);
-
-    // An unknown task fails the command instead of being ignored.
-    socket.send(JSON.stringify({ type: "task.retry", requestId: "retry-unknown", taskId: 9_999 }));
-    await expect(
-      messages.nextMatching<{ type: string; requestId?: string }>(
-        (message) => message.type === "command.result" && message.requestId === "retry-unknown",
-      ),
-    ).resolves.toMatchObject({ ok: false, error: { code: "command_failed" } });
     socket.close(1000, "test complete");
   });
 
@@ -415,9 +338,10 @@ describe("chat application", () => {
     reopenedSocket.accept();
     await reopenedMessages.next();
     const snapshot = await reopenedMessages.next<ProtocolMessage>();
-    expect(submittedTexts(snapshot).filter((text) => text === "[Alice]\nOnly once")).toHaveLength(
-      1,
-    );
+    expect(snapshot.type).toBe("conversation.view");
+    expect(
+      submittedTexts(snapshot.view).filter((text) => text === "[Alice]\nOnly once"),
+    ).toHaveLength(1);
     reopenedSocket.close(1000, "test complete");
   });
   it("acknowledges and deduplicates retried conversation creation", async () => {
@@ -447,7 +371,7 @@ describe("chat application", () => {
         ({ type, requestId }) => type === "command.result" && requestId === "stable-create-request",
       ) ||
       !creationFrames.some(
-        ({ type, conversationId }) => type === "conversation.events" && conversationId !== 1,
+        ({ type, conversationId }) => type === "conversation.view" && conversationId !== 1,
       )
     ) {
       creationFrames.push(await messages.next<CreateEvent>());
@@ -456,7 +380,7 @@ describe("chat application", () => {
       ({ type, requestId }) => type === "command.result" && requestId === "stable-create-request",
     );
     const watchIndex = creationFrames.findIndex(
-      ({ type, conversationId }) => type === "conversation.events" && conversationId !== 1,
+      ({ type, conversationId }) => type === "conversation.view" && conversationId !== 1,
     );
     expect(watchIndex).toBeLessThan(acknowledgementIndex);
     const first = creationFrames[acknowledgementIndex]!;
@@ -485,7 +409,7 @@ describe("chat application", () => {
       session: { conversations: Array<{ id: number }> };
     }>();
     expect(snapshot.session.conversations).toHaveLength(2);
-    for (let index = 0; index < 3; index++) await reopenedMessages.next();
+    for (let index = 0; index < 2; index++) await reopenedMessages.next();
 
     reopenedSocket.send(command);
     const retried = await reopenedMessages.nextMatching<CreateEvent>(
@@ -534,32 +458,23 @@ describe("chat application", () => {
       session: { conversations: [{ id: 1 }], activity: { tasks: {} } },
     });
 
-    const conversation = await messages.next<{
-      type: string;
-      conversationId: number;
-      events: Array<{ type: string; entries?: unknown[] }>;
-    }>();
+    const conversation = await messages.next<ProtocolMessage>();
     expect(conversation).toMatchObject({
-      type: "conversation.events",
+      type: "conversation.view",
       conversationId: 1,
-      events: [
-        {
-          type: "snapshot",
-          entries: [],
-          agent: {
+      view: {
+        conversation: { id: 1 },
+        entries: [],
+        docs: {
+          "pi.agent": {
             model: { provider: "openai", modelId: "gpt-6-luna" },
             thinkingLevel: "off",
             tools: ["get_weather", "schedule", "search_history"],
           },
         },
-      ],
+      },
     });
-
-    await expect(messages.next()).resolves.toEqual({
-      type: "conversation.inbox",
-      conversationId: 1,
-      items: [],
-    });
+    expect(conversation.view?.before).toBeUndefined();
     await expect(messages.next()).resolves.toEqual({
       type: "presence.typing",
       conversationId: 1,
@@ -604,24 +519,15 @@ describe("chat application", () => {
       }),
     );
 
+    // The woken Session restores the socket's watch: a fresh first value of the selected conversation.
     const restored = await messages.nextMatching<ProtocolMessage>(
       (message) =>
-        message.type === "conversation.events" &&
-        message.conversationId === created.conversationId &&
-        (message.events?.some(
-          (event) =>
-            typeof event === "object" &&
-            event !== null &&
-            "type" in event &&
-            event.type === "snapshot",
-        ) ??
-          false),
+        message.type === "conversation.view" && message.conversationId === created.conversationId,
     );
     expect(restored.conversationId).toBe(created.conversationId);
-    const attributed = await messages.nextMatching<ProtocolMessage>((message) =>
-      submittedTexts(message).includes("[Alice]\nContinue here"),
-    );
-    expect(submittedTexts(attributed)).toContain("[Alice]\nContinue here");
+    await expect(
+      messages.untilSubmitted(created.conversationId!, "[Alice]\nContinue here"),
+    ).resolves.toContain("[Alice]\nContinue here");
     socket.close(1000, "test complete");
   });
 
@@ -776,7 +682,6 @@ describe("chat application", () => {
       requestId?: string;
       ok?: boolean;
       conversationId?: number;
-      events?: Array<{ type: string }>;
       session?: {
         conversations: Array<{
           id: number;
@@ -799,11 +704,7 @@ describe("chat application", () => {
       if (event.type === "session.snapshot") {
         forkSummary = event.session?.conversations.find(({ parent }) => parent !== undefined);
       }
-      if (
-        event.type === "conversation.events" &&
-        event.conversationId !== 1 &&
-        event.events?.[0]?.type === "snapshot"
-      ) {
+      if (event.type === "conversation.view" && event.conversationId !== 1) {
         receivedForkSnapshot = true;
       }
     }
@@ -839,6 +740,52 @@ describe("chat application", () => {
     expect(
       afterRetry?.session?.conversations.filter(({ parent }) => parent !== undefined),
     ).toHaveLength(1);
+    socket.close(1000, "test complete");
+  });
+
+  it("answers a history page for entries outside the view's window", async () => {
+    const sessionId = "history-page";
+    const entryId = await seedUserEntry(sessionId, "Page me");
+    const response = await exports.default.fetch(`https://example.com/api/sessions/${sessionId}`, {
+      headers: { Upgrade: "websocket" },
+    });
+    const socket = response.webSocket!;
+    const messages = jsonMessages(socket);
+    socket.accept();
+    await messages.skipConnectFrames();
+
+    socket.send(
+      JSON.stringify({
+        type: "conversation.entries",
+        requestId: "page-1",
+        conversationId: 1,
+        query: { maxEntryId: entryId, order: "descending" },
+        limit: 10,
+      }),
+    );
+    const page = await messages.nextMatching<{
+      type: string;
+      requestId?: string;
+      entries?: unknown[];
+      next?: unknown;
+    }>((message) => message.type === "conversation.entries" && message.requestId === "page-1");
+    expect(page.entries?.map(userEntryText).filter(Boolean)).toEqual(["Page me"]);
+    expect(page.next).toBeUndefined();
+
+    socket.send(
+      JSON.stringify({
+        type: "conversation.entries",
+        requestId: "page-missing",
+        conversationId: 99,
+        query: {},
+        limit: 10,
+      }),
+    );
+    await expect(
+      messages.nextMatching<{ type: string; requestId?: string }>(
+        (message) => message.type === "command.result" && message.requestId === "page-missing",
+      ),
+    ).resolves.toMatchObject({ ok: false, command: "conversation.entries" });
     socket.close(1000, "test complete");
   });
 
